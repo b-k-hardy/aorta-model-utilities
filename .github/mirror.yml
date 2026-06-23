@@ -1,0 +1,19 @@
+name: Mirror to GitLab
+
+on:
+  push:
+    branches: ['**']
+  delete:  # mirrors branch deletions too
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history
+
+      - name: Push to GitLab
+        run: |
+          git remote add gitlab https://gitlab+deploy-token-842:${{ secrets.GITLAB_TOKEN }}@gitlab.eecs.umich.edu/bkhardy/aorta-model-utilities.git
+          git push gitlab --mirror
