@@ -15,5 +15,5 @@ jobs:
 
       - name: Push to GitLab
         run: |
-          git remote add gitlab https://gitlab+deploy-token-842:${{ secrets.GITLAB_TOKEN }}@gitlab.eecs.umich.edu/bkhardy/aorta-model-utilities.git
+          git remote add gitlab https://bkhardy:${{ secrets.GITLAB_TOKEN }}@gitlab.eecs.umich.edu/bkhardy/aorta-model-utilities.git
           git push gitlab --mirror
