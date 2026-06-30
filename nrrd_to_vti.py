@@ -1,24 +1,18 @@
-from pathlib import Path
-
 import nrrd
 import numpy as np
 import pyvista as pv
 
-segmentation_path = Path(
-    "/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/Segmentation.nrrd",
-)
-
-
-seg_data, seg_header = nrrd.read(segmentation_path)
-print(seg_data.shape)
-
 
 def assemble_velocity_vti(paths, segmentation, timestep, signs=(+1, +1, +1), to_ras=False, out_prefix="vel"):
-    """paths: dict {'rl': ..., 'ap': ..., 'fh': ...}  -> NRRD per component
+    """Convert nrrd files to vti.
+
+    paths: dict {'rl': ..., 'ap': ..., 'fh': ...}  -> NRRD per component
     signs: (s_rl, s_ap, s_fh) in {+1,-1}; verify empirically (see below)
     to_ras: if True, convert geometry AND velocity LPS->RAS (flip x,y)
-    Each NRRD is one velocity component, 3D (nx,ny,nz) or 4D (nx,ny,nz,nt).
+    Each NRRD is one velocity component, 3D (nx,ny,nz)
     """
+    # read headers and data
+    # mask velocity and convert to m/s
     data, hdrs = {}, {}
     for k, p in paths.items():
         data[k], hdrs[k] = nrrd.read(p)
@@ -57,36 +51,40 @@ def assemble_velocity_vti(paths, segmentation, timestep, signs=(+1, +1, +1), to_
     if to_ras:
         vec = vec @ F.T  # flip vx, vy
 
-    grid = pv.ImageData(dimensions=(nx, ny, nz))
+    grid = pv.ImageData(dimensions=(nx + 1, ny + 1, nz + 1))
     grid.origin = tuple(org_w)
     grid.spacing = tuple(spacing)
     grid.direction_matrix = dir_w  # needs VTK 9+/recent ParaView
-    grid.point_data["velocity"] = vec
-    grid.point_data.active_vectors_name = "velocity"
+    grid.cell_data["velocity"] = vec
+    grid.cell_data.active_vectors_name = "velocity"
     grid.save(f"{out_prefix}_t{timestep:03d}.vti")
 
-    # PVD time-series wrapper
-    with open(f"{out_prefix}.pvd", "w") as f:
-        f.write('<?xml version="1.0"?>\n<VTKFile type="Collection"><Collection>\n')
-        f.write(f'<DataSet timestep="{timestep}" file="{out_prefix}_t{timestep:03d}.vti"/>\n')
-        f.write("</Collection></VTKFile>\n")
+
+def main() -> None:
+
+    # TODO (for Brandon): incorporate Slicer scripting (manual NRRD export for now)
+
+    # path to segmentation that has already been exported into 4d flow grid
+    segmentation_path = (
+        "/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/"
+        "data/4d_flow_nrrd/Segmentation.v2.nrrd"
+    )
+    seg_data, _ = nrrd.read(segmentation_path)
+
+    # Number of timesteps in 4d flow DICOM series.
+    # NOTE: If you don't know this you can find it in 3D slicer in the top left where it says "Sequence Browser"
+    N_TIMESTEPS = 21
+
+    for t in range(N_TIMESTEPS):
+        print(f"Processing time step {t}...")
+        fh_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_FH/505 MR DelRec - 4D PC_FH - 42 frames Volume Sequence by InstanceNumber {21 + t}.nrrd"
+        ap_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_AP/504 MR DelRec - 4D PC_AP - 21 frames Volume Sequence by TriggerTime {t}.nrrd"
+        rl_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_RL/503 MR DelRec - 4D PC_RL - 21 frames Volume Sequence by TriggerTime {t}.nrrd"
+
+        image_paths = {"fh": fh_path, "ap": ap_path, "rl": rl_path}
+
+        assemble_velocity_vti(image_paths, seg_data, t, signs=(+1, +1, +1), to_ras=False, out_prefix="UM8_velocity")
 
 
-N_TIMESTEPS = 21
-
-
-for t in range(N_TIMESTEPS):
-    """paths: dict {'rl': ..., 'ap': ..., 'fh': ...}  -> NRRD per component
-    signs: (s_rl, s_ap, s_fh) in {+1,-1}; verify empirically (see below)
-    to_ras: if True, convert geometry AND velocity LPS->RAS (flip x,y)
-    Each NRRD is one velocity component, 3D (nx,ny,nz) or 4D (nx,ny,nz,nt).
-    """
-
-    print(f"Processing time step {t}...")
-    fh_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_FH/505 MR DelRec - 4D PC_FH - 42 frames Volume Sequence by InstanceNumber {21 + t}.nrrd"
-    ap_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_AP/504 MR DelRec - 4D PC_AP - 21 frames Volume Sequence by TriggerTime {t}.nrrd"
-    rl_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_RL/503 MR DelRec - 4D PC_RL - 21 frames Volume Sequence by TriggerTime {t}.nrrd"
-
-    image_paths = {"fh": fh_path, "ap": ap_path, "rl": rl_path}
-
-    assemble_velocity_vti(image_paths, seg_data, t, signs=(+1, +1, +1), to_ras=False, out_prefix="vel")
+if __name__ == "__main__":
+    main()
