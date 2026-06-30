@@ -45,12 +45,6 @@ import numpy as np
 import pyvista as pv
 from scipy import ndimage
 
-DATA_DIR = Path(
-    "/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/"
-    "Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_paraview",
-)
-N_TIMEPOINTS = 21
-
 
 @dataclass
 class FilterConfig:
@@ -98,20 +92,30 @@ _FACE = ndimage.generate_binary_structure(3, 1)
 # ---------------------------------------------------------------------------
 # IO
 # ---------------------------------------------------------------------------
-def load_stack(data_dir: Path = DATA_DIR, n: int = N_TIMEPOINTS):
+def load_stack(data_dir: Path, n: int, venc: float = 2.0):
     """Load every frame into a dense ``(T, nz, ny, nx, 3)`` array plus the mask.
 
     Voxels outside the lumen are set to NaN so they are ignored by every
     neighbour statistic.  Returns ``(velocity, mask, template)`` where
     ``template`` is the first ImageData object (geometry to clone on write).
     """
-    template = pv.read(data_dir / f"UM8_paraview_viz_{0:03d}.vti")
+    # FIXME: change hardcoded strings
+    template = pv.read(data_dir / f"UM8_velocity_t{0:03d}.vti")
+    inner_prod = np.einsum("ij,ij->i", template.cell_data["velocity"], template.cell_data["velocity"])
     nx, ny, nz = np.array(template.dimensions) - 1
-    mask = (pv.read(data_dir / "UM8_paraview_viz_mask.vti").cell_data["mask"] > 0).reshape(nz, ny, nx)
+
+    exterior_mask = (inner_prod > 1e-8) | (inner_prod < -1e-8)
+    print(f"exterior_mask size: {exterior_mask.sum()}")
+    out_of_bounds_mask = np.any(np.abs(template.cell_data["velocity"]) < venc, axis=1)
+    print(f"out_of_bounds_mask size: {out_of_bounds_mask.sum()}")
+    mask = (exterior_mask & out_of_bounds_mask).reshape(nz, ny, nx)
+    print(f"total mask size: {mask.sum()}")
+    # NOTE: add things about being below 2 per component?
+    # mask = (pv.read(data_dir / "UM8_paraview_viz_mask.vti").cell_data["mask"] > 0).reshape(nz, ny, nx)
 
     vel = np.full((n, nz, ny, nx, 3), np.nan, dtype=np.float32)
     for i in range(n):
-        frame = pv.read(data_dir / f"UM8_paraview_viz_{i:03d}.vti")
+        frame = pv.read(data_dir / f"UM8_velocity_t{i:03d}.vti")
         vel[i] = frame.cell_data["velocity"].reshape(nz, ny, nx, 3)
     vel[:, ~mask] = np.nan
     return vel, mask, template
@@ -399,6 +403,7 @@ def _boundary_pct(sel, mask):
     return round(100.0 * (sel & boundary).sum() / sel.sum(), 1)
 
 
+# FIXME: change hardcoded strings
 def write_outputs(result: FilterResult, template: pv.ImageData, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     nz, ny, nx = result.mask.shape
@@ -419,9 +424,15 @@ def write_outputs(result: FilterResult, template: pv.ImageData, out_dir: Path):
 
 
 def main():
+
+    DATA_DIR = Path(
+        "/Users/bkhardy/Developer/aorta-model-utilities",
+    )
+    N_TIMEPOINTS = 21
+
     cfg = FilterConfig()
     print("Loading stack...")
-    vel, mask, template = load_stack()
+    vel, mask, template = load_stack(DATA_DIR, N_TIMEPOINTS)
     print(f"  lumen voxels: {int(mask.sum())},  frames: {vel.shape[0]}")
 
     print("Filtering...")
