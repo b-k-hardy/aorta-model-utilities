@@ -36,7 +36,7 @@ def assemble_velocity_vti(paths, segmentation, timestep, signs=(+1, +1, +1), to_
     s_rl, s_ap, s_fh = signs
 
     # optional LPS -> RAS (flip L and P): applies identically to geometry and vectors
-    F = np.diag([-1.0, -1.0, 1.0]) if to_ras else np.eye(3)
+    F = np.diag([-1e-3, -1e-3, 1e-3]) if to_ras else 1e-3 * np.eye(3)
     org_w, dir_w = F @ org, F @ direction
 
     sl = (Ellipsis,)
