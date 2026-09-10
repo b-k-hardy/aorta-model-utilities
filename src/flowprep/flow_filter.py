@@ -38,6 +38,8 @@ frames + an updated mask + a diagnostics report into ``./output``.
 
 from __future__ import annotations
 
+import argparse
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,9 +55,35 @@ class FilterConfig:
     via MAD, so the same defaults transfer to other acquisitions.
     """
 
-    # Robust threshold strength: flag a residual above median + k * MAD.
+    # Robust threshold strength: flag a residual above median + k * MAD.  These
+    # act on the *scale-normalized* spatial / temporal scores (dimensionless),
+    # so the same k transfers across resolutions and flow velocities.
     spatial_k: float = 5.0
     temporal_k: float = 5.0
+    # Optionally also inpaint frames that are anomalous in BOTH space (magnitude)
+    # and time, without the direction gate -- catches single-frame magnitude
+    # spikes that stay aligned with the flow.  Off by default: it costs a little
+    # jet-peak smoothing, and the direction-gated detector already handles the
+    # common (reversed / aliased) errors.
+    flag_temporal_spikes: bool = False
+    # Direction gate for INTERIOR spatial outliers: a voxel is only an outlier if
+    # it points more than acos(cos_gate) away from its neighbourhood mean.  With
+    # cos_gate=0.5 that means >60 deg off.  Genuine high-shear / jet / curved flow
+    # stays within ~45 deg of its neighbours (cos>0.7), so it is spared, while
+    # perpendicular (~90 deg) and reversed core outliers -- e.g. a big vector
+    # crossing the inlet jet -- are caught.  Lower toward 0.0 to be gentler on the
+    # core (0.0 = only flag fully reversed voxels).
+    cos_gate: float = 0.5
+    # Direction gate for BOUNDARY voxels.  Partial-volume / segmentation errors on
+    # the boundary are the main target and are usually *aligned* (right-ish
+    # direction, wrong magnitude), so the strict interior gate misses them.  A
+    # laxer gate here removes them aggressively; removing boundary voxels is also
+    # topology-safe.  1.0 == no direction gate (flag on magnitude + persistence
+    # alone); lower it toward cos_gate to be gentler on the boundary.
+    boundary_cos_gate: float = 1.0
+    # Optional override for the velocity noise floor (m/s) used to scale-normalize
+    # the residuals.  None -> derived robustly from the data (median residual).
+    residual_floor: float | None = None
     # A voxel is "chronic" (excluded) if it is a spatial outlier in at least this
     # fraction of frames.
     chronic_fraction: float = 0.40
@@ -77,6 +105,18 @@ class FilterConfig:
     # Removes partial-volume "speckle" voxels that touch the body only through an
     # edge/corner (disconnected under the solver's 6-connectivity).
     keep_largest_component: bool = True
+    # Second pass: after the main filter, hunt for coherent "bad blobs" that the
+    # direction gate cannot catch -- clusters of vectors that agree in direction
+    # with each other but are wrong in magnitude (e.g. the aliased/corrupted flow
+    # at a dissection tear).  They are found as clusters that stay spatially
+    # inconsistent after pass 1, and their bad frames are smooth-inpainted from
+    # the surrounding good flow.  This deliberately trades away complex-flow detail
+    # in those spots for the removal of the bad vectors.
+    clean_residual_hotspots: bool = True
+    hotspot_residual: float = 0.5  # abs neighbour-residual (m/s) marking a bad voxel-frame
+    hotspot_min_frames: int = 2  # a hotspot voxel must be bad in >= this many frames
+    hotspot_min_cluster: int = 30  # only treat clusters this big as coherent blobs
+    hotspot_inpaint_iters: int = 40  # extra fill passes (blobs are thick)
 
 
 # 3x3x3 footprint with the centre removed (26 neighbours).
@@ -214,52 +254,85 @@ def _robust_threshold(values: np.ndarray, k: float) -> float:
     return float(med + k * mad)
 
 
-def spatial_residual(vel: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Per voxel-frame magnitude of the deviation from the spatial-neighbour
-    mean, ``(T, nz, ny, nx)``.
+def spatial_score(vel, mask, floor=None):
+    """Scale- and direction-aware spatial outlier score, ``(T, nz, ny, nx)``.
 
-    Two passes: the first uses every masked neighbour, the second drops the
-    grossly deviating voxels so a bad voxel cannot inflate its own neighbours'
-    mean and hide itself.
+    For each voxel-frame we compare the vector ``v`` to the mean ``nm`` of its
+    26 spatial neighbours and return two grids:
+
+    * ``score`` -- ``|v - nm| / (|nm| + floor)``.  Normalizing by the local flow
+      magnitude (plus a noise floor) makes the score dimensionless and roughly
+      homoscedastic: a fast jet voxel and a slow near-wall voxel are judged on
+      the same relative scale, instead of an absolute m/s threshold that a strong
+      jet always trips.
+    * ``cos`` -- cosine between ``v`` and ``nm``, i.e. how well the voxel agrees
+      in *direction* with its neighbourhood.
+
+    An outlier is a voxel with a large ``score`` **and** a small ``cos``.  Real
+    high-shear / curved / jet flow has a large score too, but stays directionally
+    aligned (``cos`` high); only aliased / partial-volume errors reverse.
+
+    ``floor`` defaults to the robust median absolute residual (the velocity-noise
+    level).  Two passes: the first identifies gross outliers, the second recomputes
+    the neighbour mean without them so a bad voxel cannot hide in its own mean.
     """
     T = vel.shape[0]
     res = np.full(vel.shape[:4], np.nan, dtype=np.float32)
     for t in range(T):
-        nm = _neighbour_mean(vel[t], mask)
-        res[t] = np.linalg.norm(vel[t] - nm, axis=-1)
-
+        res[t] = np.linalg.norm(vel[t] - _neighbour_mean(vel[t], mask), axis=-1)
     gross = res > _robust_threshold(res, k=6.0)
-    res2 = np.full_like(res, np.nan)
+    if floor is None:
+        floor = float(np.median(res[np.isfinite(res) & ~gross]))
+
+    score = np.full(vel.shape[:4], np.nan, dtype=np.float32)
+    cos = np.full(vel.shape[:4], np.nan, dtype=np.float32)
     for t in range(T):
         good = mask & ~gross[t]
         nm = _neighbour_mean(vel[t], good)
-        # Fall back to the first-pass mean where decontamination left no neighbour.
         fallback = _neighbour_mean(vel[t], mask)
         nm = np.where(np.isfinite(nm), nm, fallback)
-        res2[t] = np.linalg.norm(vel[t] - nm, axis=-1)
-    return res2
+        d = np.linalg.norm(vel[t] - nm, axis=-1)
+        nmag = np.linalg.norm(nm, axis=-1)
+        score[t] = d / (nmag + floor)
+        dot = np.einsum("...i,...i->...", vel[t], nm)
+        cos[t] = dot / np.maximum(np.linalg.norm(vel[t], axis=-1) * nmag, 1e-9)
+    return score, cos, floor
 
 
-def temporal_residual(vel: np.ndarray, periodic: bool) -> np.ndarray:
-    """Per voxel-frame deviation from the mean of the previous and next frame."""
+def temporal_score(vel, periodic, floor=None):
+    """Scale-normalized temporal outlier score, ``(T, nz, ny, nx)``.
+
+    ``|v(t) - (v(t-1)+v(t+1))/2| / (|(v(t-1)+v(t+1))/2| + floor)`` -- the second
+    difference relative to the local temporal magnitude.  A smoothly pulsing jet
+    has a small relative second difference even though its absolute swing is
+    large, so normalizing avoids flagging the jet just for being dynamic; a
+    single-frame spike stands out.
+    """
     if periodic:
         prev, nxt = np.roll(vel, 1, axis=0), np.roll(vel, -1, axis=0)
     else:
         prev = np.concatenate([vel[:1], vel[:-1]], axis=0)
         nxt = np.concatenate([vel[1:], vel[-1:]], axis=0)
-    return np.linalg.norm(vel - 0.5 * (prev + nxt), axis=-1)
+    mid = 0.5 * (prev + nxt)
+    d = np.linalg.norm(vel - mid, axis=-1)
+    if floor is None:
+        floor = float(np.median(d[np.isfinite(d)]))
+    return d / (np.linalg.norm(mid, axis=-1) + floor)
 
 
 # ---------------------------------------------------------------------------
 # Inpainting
 # ---------------------------------------------------------------------------
-def inpaint(vel, keep_mask, replace_mask, cfg: FilterConfig):
+def inpaint(vel, keep_mask, replace_mask, cfg: FilterConfig, iters=None):
     """Fill ``replace_mask`` voxel-frames with a spatiotemporal weighted average
     of *good* neighbours (``keep_mask & ~replace_mask``).
 
     Iterated so that a bad voxel whose neighbours are also bad still fills once
     its neighbours have been filled.  Spatial neighbours (26-connected, weight 1)
     and the +/- temporal_halfwidth temporal neighbours (weight 1) both vote.
+
+    ``iters`` overrides ``cfg.inpaint_iters`` (a thick blob needs more passes to
+    fill from its surface inward).
     """
     out = vel.copy()
     out[replace_mask] = np.nan  # forget the bad values before we average
@@ -268,7 +341,7 @@ def inpaint(vel, keep_mask, replace_mask, cfg: FilterConfig):
     T = vel.shape[0]
     hw = cfg.temporal_halfwidth
 
-    for _ in range(cfg.inpaint_iters):
+    for _ in range(cfg.inpaint_iters if iters is None else iters):
         if not todo.any():
             break
         valid = good | (keep_mask & np.isfinite(out[..., 0]))
@@ -327,16 +400,33 @@ class FilterResult:
 
 def filter_4dflow(vel, mask, cfg: FilterConfig = FilterConfig()) -> FilterResult:
     T = vel.shape[0]
-    sres = spatial_residual(vel, mask)
-    tres = temporal_residual(vel, cfg.periodic_time)
+    sscore, scos, floor = spatial_score(vel, mask, cfg.residual_floor)
 
-    s_thr = _robust_threshold(sres, cfg.spatial_k)
-    t_thr = _robust_threshold(tres, cfg.temporal_k)
-    spatial_flag = sres > s_thr
-    temporal_flag = tres > t_thr
+    s_thr = _robust_threshold(sscore, cfg.spatial_k)
+    mag_anom = sscore > s_thr
+    # Spatial outlier = large scale-normalized residual AND directional disagreement
+    # (points away from the neighbourhood).  The direction gate spares fast-but-
+    # coherent jet / shear / curved flow.  The gate is per-voxel: strict in the
+    # interior (protect the jet), lax on the boundary (aggressively remove aligned
+    # partial-volume errors, which is topology-safe).  This single flag drives both
+    # chronic exclusion and transient inpainting -- the distinction is only how
+    # many frames it fires (persistent vs. sparse).
+    n_neigh = ndimage.convolve(mask.astype(np.float32), _FOOT, mode="constant")
+    boundary = mask & (n_neigh < 26)
+    gate = np.where(boundary, cfg.boundary_cos_gate, cfg.cos_gate)
+    outlier = mag_anom & (scos < gate[None])
 
-    # Chronic = spatially wrong in too many frames.
-    frames_off = spatial_flag.sum(axis=0)
+    # Optional: also treat frames that are anomalous in both space and time as
+    # transient spikes to inpaint (see FilterConfig.flag_temporal_spikes).
+    t_thr = float("nan")
+    if cfg.flag_temporal_spikes:
+        tscore = temporal_score(vel, cfg.periodic_time, cfg.residual_floor)
+        t_thr = _robust_threshold(tscore, cfg.temporal_k)
+        outlier = outlier | (mag_anom & (tscore > t_thr))
+
+    # Chronic = a persistent spatial outlier -> exclude/reclaim; sparse outliers
+    # are transient -> inpaint.
+    frames_off = outlier.sum(axis=0)
     chronic = mask & (frames_off >= cfg.chronic_fraction * T)
 
     # Only exclude chronic voxels that stay connected to the exterior; excluding
@@ -366,14 +456,32 @@ def filter_4dflow(vel, mask, cfg: FilterConfig = FilterConfig()) -> FilterResult
     # (T, nz, ny, nx) lumen mask after exclusion, replicated over time.
     keep_mask = np.broadcast_to(updated_mask, vel.shape[:4]).copy()
 
-    # Transient bad voxel-frames (spatial OR temporal flag), plus every frame of
-    # the kept-but-chronically-bad ("reclaimed") interior voxels and any newly
-    # filled cavity voxels.
-    replace = keep_mask & (spatial_flag | temporal_flag)
+    # Transient bad voxel-frames (sparse outliers), plus every frame of the
+    # kept-but-chronically-bad ("reclaimed") interior voxels and any newly filled
+    # cavity voxels.
+    replace = keep_mask & outlier
     replace |= np.broadcast_to(reclaim | filled, vel.shape[:4])
 
     cleaned = inpaint(vel, keep_mask, replace, cfg)
     cleaned[~keep_mask] = 0.0  # excluded voxels and outside-lumen -> zero
+
+    # Second pass: coherent bad blobs (see FilterConfig.clean_residual_hotspots).
+    hotspot_voxels = 0
+    hotspot_vf = 0
+    if cfg.clean_residual_hotspots:
+        blob, hot_vf = _residual_hotspots(cleaned, updated_mask, cfg)
+        if hot_vf.any():
+            cleaned = inpaint(
+                cleaned,
+                keep_mask,
+                hot_vf,
+                cfg,
+                iters=cfg.hotspot_inpaint_iters,
+            )
+            cleaned[~keep_mask] = 0.0
+        hotspot_voxels = int(blob.sum())
+        hotspot_vf = int(hot_vf.sum())
+        replace = replace | hot_vf
 
     stats = {
         "n_lumen": int(mask.sum()),
@@ -383,7 +491,10 @@ def filter_4dflow(vel, mask, cfg: FilterConfig = FilterConfig()) -> FilterResult
         "n_preexisting_cavity_voxels": int(cavities_in.sum()),
         "n_cavities_filled": int(filled.sum()),
         "n_speckle_voxels_removed": int(islands_removed.sum()),
+        "n_hotspot_blob_voxels": hotspot_voxels,
+        "n_hotspot_voxelframes_cleaned": hotspot_vf,
         "n_voxelframes_replaced": int(replace.sum()),
+        "noise_floor": floor,
         "spatial_threshold": s_thr,
         "temporal_threshold": t_thr,
         "excluded_on_boundary_pct": _boundary_pct(exclude, mask),
@@ -393,6 +504,37 @@ def filter_4dflow(vel, mask, cfg: FilterConfig = FilterConfig()) -> FilterResult
         ),
     }
     return FilterResult(cleaned, updated_mask, exclude, replace, stats)
+
+
+def _residual_hotspots(cleaned, mask, cfg):
+    """Find coherent bad blobs left after the main pass.
+
+    A voxel-frame is "bad" if its velocity still deviates from its spatial
+    neighbours by more than ``hotspot_residual`` m/s (an absolute, gross-error
+    threshold -- ~10x the smooth-flow residual).  Voxels bad in at least
+    ``hotspot_min_frames`` frames seed 26-connected clusters; clusters of at
+    least ``hotspot_min_cluster`` voxels are treated as coherent blobs.
+
+    Returns ``(blob, hot_vf)``: the blob voxel mask ``(nz, ny, nx)`` and the
+    boolean voxel-frame grid ``(T, ...)`` of bad frames within those blobs (only
+    the bad frames are re-inpainted, so good diastolic frames are preserved).
+    """
+    T = cleaned.shape[0]
+    resf = np.full(cleaned.shape[:4], np.nan, dtype=np.float32)
+    for t in range(T):
+        resf[t] = np.linalg.norm(
+            cleaned[t] - _neighbour_mean(cleaned[t], mask),
+            axis=-1,
+        )
+    bad_vf = np.nan_to_num(resf) > cfg.hotspot_residual
+    seed = mask & (bad_vf.sum(axis=0) >= cfg.hotspot_min_frames)
+    lab, _ = ndimage.label(seed, structure=np.ones((3, 3, 3), bool))
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    big = np.where(sizes >= cfg.hotspot_min_cluster)[0]
+    blob = np.isin(lab, big)
+    hot_vf = bad_vf & blob[None]
+    return blob, hot_vf
 
 
 def _boundary_pct(sel, mask):
@@ -423,16 +565,22 @@ def write_outputs(result: FilterResult, template: pv.ImageData, out_dir: Path):
     report.write_text("\n".join(lines) + "\n")
 
 
-def main():
+def main(argv=None) -> None:
 
-    DATA_DIR = Path(
-        "/Users/bkhardy/Developer/aorta-model-utilities",
-    )
-    N_TIMEPOINTS = 21
+    p = argparse.ArgumentParser(description="Filter 4D Flow velocity vti data")
+    p.add_argument("--data_dir", type=Path, default=None, help="Directory containing the input VTI files")
+    p.add_argument("--n-timesteps", type=int, default=1, help="Number of time steps in the 4D flow data")
+
+    args = p.parse_args(argv)
+
+    # DATA_DIR = args.data_dir or Path(
+    #   "/Users/bkhardy/Developer/aorta-model-utilities",
+    # )
+    # N_TIMEPOINTS = 21
 
     cfg = FilterConfig()
     print("Loading stack...")
-    vel, mask, template = load_stack(DATA_DIR, N_TIMEPOINTS)
+    vel, mask, template = load_stack(args.data_dir, args.n_timesteps)
     print(f"  lumen voxels: {int(mask.sum())},  frames: {vel.shape[0]}")
 
     print("Filtering...")
