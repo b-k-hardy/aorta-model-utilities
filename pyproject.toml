@@ -1,7 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
 [project]
-name = "aorta-model-utilities"
+name = "flowprep"
 version = "0.1.0"
-description = "Add your description here"
+description = "Utilities for aortic model flow split preprocessing"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -12,8 +17,10 @@ dependencies = [
     "scipy>=1.18.0",
 ]
 
+[project.scripts]
+nrrd2vti = "flowprep.nrrd_to_vti:main"
+flowfilter = "flowprep.flow_filter:main"
+
+
 [dependency-groups]
-dev = [
-    "jupyter>=1.1.1",
-    "ruff>=0.15.18",
-]
+dev = ["jupyter>=1.1.1", "ruff>=0.15.18"]
