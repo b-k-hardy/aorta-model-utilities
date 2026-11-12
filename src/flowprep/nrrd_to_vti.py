@@ -16,6 +16,7 @@ def assemble_velocity_vti_step(
     *,
     to_ras: bool = False,
     out_prefix: str = "vel",
+    out_dir: str | None = None,
 ):
     """Convert nrrd files exported from 3D Slicer to vti.
 
@@ -70,7 +71,10 @@ def assemble_velocity_vti_step(
     grid.direction_matrix = dir_w  # needs VTK 9+/recent ParaView
     grid.cell_data["velocity"] = vec
     grid.cell_data.active_vectors_name = "velocity"
-    grid.save(f"{out_prefix}_t{timestep:03d}.vti")
+    if out_dir:
+        grid.save(f"{out_dir}/{out_prefix}_t{timestep:03d}.vti")
+    else:
+        grid.save(f"{out_prefix}_t{timestep:03d}.vti")
 
 
 def nrrd_to_vti(
@@ -81,6 +85,7 @@ def nrrd_to_vti(
     *,
     to_ras=False,
     out_prefix="vel",
+    out_dir=None,
 ):
     rl_pat, ap_pat, fh_pat = image_patterns  # RL, AP, FH order, matching the CLI help
     seg_data, _ = nrrd.read(seg_path)
@@ -91,7 +96,15 @@ def nrrd_to_vti(
             "ap": Path(ap_pat.format(t)),
             "fh": Path(fh_pat.format(t)),
         }
-        assemble_velocity_vti_step(paths_t, seg_data, t, signs=signs, to_ras=to_ras, out_prefix=out_prefix)
+        assemble_velocity_vti_step(
+            paths_t,
+            seg_data,
+            t,
+            signs=signs,
+            to_ras=to_ras,
+            out_prefix=out_prefix,
+            out_dir=out_dir,
+        )
 
 
 def main(argv=None) -> None:
@@ -132,7 +145,13 @@ def main(argv=None) -> None:
     )
     p.add_argument("--out_prefix", "-o", type=str, default="vel", help="Prefix for output VTI files")
 
-    # p.add
+    p.add_argument(
+        "--out_dir",
+        "-od",
+        type=str,
+        default=None,
+        help="Output directory for VTI files. DIRECTORY MUST EXIST. (default: current directory)",
+    )
 
     args = p.parse_args(argv)
 
@@ -145,6 +164,7 @@ def main(argv=None) -> None:
         signs=args.signs,
         to_ras=args.to_ras,
         out_prefix=args.out_prefix,
+        out_dir=args.out_dir,
     )
 
     return 0
