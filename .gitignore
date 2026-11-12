@@ -12,6 +12,7 @@ wheels/
 # Data formats
 *.nrrd
 *.vti
+*.vtu
 
 # Mac-related metadata
 .DS_Store
