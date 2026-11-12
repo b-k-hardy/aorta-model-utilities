@@ -1,5 +1,6 @@
 import argparse
 import sys
+from pathlib import Path
 
 import nrrd
 import numpy as np
@@ -72,55 +73,79 @@ def assemble_velocity_vti_step(
     grid.save(f"{out_prefix}_t{timestep:03d}.vti")
 
 
-def nrrd_to_vti(image_paths, seg_data, n_timesteps: int, signs=(+1, +1, +1), *, to_ras=False, out_prefix="vel"):
-    for t in range(n_timesteps):
+def nrrd_to_vti(
+    image_patterns,
+    seg_path,
+    frames: tuple[int, int],
+    signs=(+1, +1, +1),
+    *,
+    to_ras=False,
+    out_prefix="vel",
+):
+    rl_pat, ap_pat, fh_pat = image_patterns  # RL, AP, FH order, matching the CLI help
+    seg_data, _ = nrrd.read(seg_path)
+    for t in range(frames[0], frames[1] + 1):
         print(f"Processing time step {t}...")
-
-        image_paths = {"fh": image_paths[0], "ap": image_paths[1], "rl": image_paths[2]}
-
-        assemble_velocity_vti_step(
-            image_paths,
-            seg_data,
-            t,
-            signs=(+1, +1, +1),
-            to_ras=False,
-            out_prefix="UM8_velocity",
-        )
+        paths_t = {
+            "rl": Path(rl_pat.format(t)),
+            "ap": Path(ap_pat.format(t)),
+            "fh": Path(fh_pat.format(t)),
+        }
+        assemble_velocity_vti_step(paths_t, seg_data, t, signs=signs, to_ras=to_ras, out_prefix=out_prefix)
 
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Convert 4D Flow NRRD exported from 3D Slicer to VTI")
-    p.add_argument("--seg_path", type=str, default=None, help="Path to segmentation NRRD file")
-    p.add_argument("--n-timesteps", "-nt", type=int, default=1, help="Number of timesteps in 4D Flow DICOM series")
     p.add_argument(
-        "--image_paths",
-        "-ip",
+        "--image_path_pattern",
+        "-ipp",
         type=str,
         nargs=3,
         default=None,
-        help="Paths to NRRD files for RL, AP, FH components (in that order)",
+        required=True,
+        help="Paths to NRRD files for RL, AP, FH components (in that order). E.g., data/file{:02d}.nrrd",
     )
+    p.add_argument(
+        "--frames",
+        "-f",
+        nargs=2,
+        type=int,
+        metavar=("FIRST", "LAST"),
+        required=True,
+        help="First and last frame numbers (inclusive) to process",
+    )
+    p.add_argument("--seg_path", type=str, default=None, required=True, help="Path to segmentation NRRD file")
+
+    p.add_argument(
+        "--signs",
+        "-s",
+        type=int,
+        nargs=3,
+        default=(+1, +1, +1),
+        help="Signs for RL, AP, FH components (in that order)",
+    )
+    p.add_argument(
+        "--to_ras",
+        "-r",
+        action="store_true",
+        help="Convert geometry and velocity from LPS to RAS",
+    )
+    p.add_argument("--out_prefix", "-o", type=str, default="vel", help="Prefix for output VTI files")
+
+    # p.add
 
     args = p.parse_args(argv)
 
     # TODO potentially incorporate Slicer scripting (manual NRRD export for now)
 
-    # path to segmentation that has already been exported into 4d flow grid
-    seg_data, _ = nrrd.read(args.seg_path)
-
     nrrd_to_vti(
-        args.image_paths,
-        seg_data,
-        args.n_timesteps,
-        signs=(+1, +1, +1),
-        to_ras=False,
-        out_prefix="UM8_velocity",
+        args.image_path_pattern,
+        args.seg_path,
+        tuple(args.frames),
+        signs=args.signs,
+        to_ras=args.to_ras,
+        out_prefix=args.out_prefix,
     )
-
-    # NOTE: these are sample paths that I'm hanging onto for reference (for now)
-    # fh_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_FH/505 MR DelRec - 4D PC_FH - 42 frames Volume Sequence by InstanceNumber {21 + t}.nrrd"
-    # ap_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_AP/504 MR DelRec - 4D PC_AP - 21 frames Volume Sequence by TriggerTime {t}.nrrd"
-    # rl_path = f"/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/PC_RL/503 MR DelRec - 4D PC_RL - 21 frames Volume Sequence by TriggerTime {t}.nrrd"
 
     return 0
 
