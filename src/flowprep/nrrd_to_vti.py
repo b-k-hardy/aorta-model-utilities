@@ -16,7 +16,7 @@ def assemble_velocity_vti_step(
     to_ras: bool = False,
     out_prefix: str = "vel",
 ):
-    """Convert nrrd files to vti.
+    """Convert nrrd files exported from 3D Slicer to vti.
 
     paths: dict {'rl': ..., 'ap': ..., 'fh': ...}  -> NRRD per component
     signs: (s_rl, s_ap, s_fh) in {+1,-1}; verify empirically (see below)
@@ -73,7 +73,6 @@ def assemble_velocity_vti_step(
 
 
 def nrrd_to_vti(image_paths, seg_data, n_timesteps: int, signs=(+1, +1, +1), *, to_ras=False, out_prefix="vel"):
-
     for t in range(n_timesteps):
         print(f"Processing time step {t}...")
 
@@ -90,7 +89,6 @@ def nrrd_to_vti(image_paths, seg_data, n_timesteps: int, signs=(+1, +1, +1), *, 
 
 
 def main(argv=None) -> None:
-
     p = argparse.ArgumentParser(description="Convert 4D Flow NRRD exported from 3D Slicer to VTI")
     p.add_argument("--seg_path", type=str, default=None, help="Path to segmentation NRRD file")
     p.add_argument("--n-timesteps", "-nt", type=int, default=1, help="Number of timesteps in 4D Flow DICOM series")
