@@ -11,6 +11,8 @@ def main() -> None:
 
     seg_path = "/Users/bkhardy/Library/CloudStorage/Dropbox-UniversityofMichigan/Brandon Hardy/fsi_ad/AD_model2/data/4d_flow_nrrd/Segmentation.nrrd"
 
+    out_dir = "./UM8_output"  # NOTE: make sure this exists first!!
+
     nrrd_to_vti(
         image_patterns=[
             rl_path,
@@ -22,6 +24,7 @@ def main() -> None:
         signs=(+1, +1, +1),
         to_ras=False,
         out_prefix="UM8_velocity",
+        out_dir=out_dir,
     )
 
 
