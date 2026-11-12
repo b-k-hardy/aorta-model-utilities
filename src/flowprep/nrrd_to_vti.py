@@ -6,6 +6,7 @@ import nrrd
 import numpy as np
 import pyvista as pv
 from numpy.typing import NDArray
+from tqdm import tqdm
 
 
 def assemble_velocity_vti_step(
@@ -89,7 +90,7 @@ def nrrd_to_vti(
 ):
     rl_pat, ap_pat, fh_pat = image_patterns  # RL, AP, FH order, matching the CLI help
     seg_data, _ = nrrd.read(seg_path)
-    for t in range(frames[0], frames[1] + 1):
+    for t in tqdm(range(frames[0], frames[1] + 1)):
         print(f"Processing time step {t}...")
         paths_t = {
             "rl": Path(rl_pat.format(t)),
