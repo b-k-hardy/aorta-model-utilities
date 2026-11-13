@@ -1,4 +1,4 @@
-from flowprep.nrrd_to_vti import nrrd_to_vti
+from flowprep import nrrd_to_vti
 
 
 def main() -> None:
